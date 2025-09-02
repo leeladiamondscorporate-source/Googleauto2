@@ -1,0 +1,7 @@
+pandas==2.1.4
+google-cloud-storage==2.10.0
+flask==3.0.0
+python-dotenv==1.0.0
+ftplib3==0.4.0
+lxml==4.9.3
+tqdm==4.66.1
