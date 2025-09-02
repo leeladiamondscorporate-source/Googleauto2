@@ -8,7 +8,23 @@ import re
 import xml.etree.ElementTree as ET
 from urllib.parse import quote
 import hashlib
+# At the top of main.py, add environment variable handling for GitHub Actions
+import os
+import json
+import base64
 
+# Handle GitHub Actions environment
+if os.environ.get('GITHUB_ACTIONS'):
+    # Decode base64 encoded service account key from GitHub Secrets
+    service_account_info = json.loads(base64.b64decode(os.environ.get('GCP_SA_KEY')).decode())
+    
+    # Create temporary service account file
+    with open('/tmp/service-account-key.json', 'w') as f:
+        json.dump(service_account_info, f)
+    
+    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = '/tmp/service-account-key.json'
+
+# Rest of your code remains the same...
 # ----------------------------
 # CONFIGURATION & CREDENTIALS
 # ----------------------------
@@ -915,4 +931,5 @@ if __name__ == "__main__":
         validation = validate_feed_seo_compliance(output_file)
         print(f"Feed validation: {validation}")
     
+
     print("Process completed with SEO optimizations!")
