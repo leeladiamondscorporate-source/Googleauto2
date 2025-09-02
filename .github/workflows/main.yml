@@ -7,103 +7,292 @@ on:
   
   # Allows manual trigger from GitHub UI
   workflow_dispatch:
+    inputs:
+      force_run:
+        description: 'Force run even if recent successful run exists'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  PYTHON_VERSION: '3.11'
+  FTP_SERVER: 'ftp.nivoda.net'
+  FTP_PORT: '21'
 
 jobs:
   upload-feed:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
     
-    - name: Set up Python 3.11
-      uses: actions/setup-python@v4
+    - name: Set up Python ${{ env.PYTHON_VERSION }}
+      uses: actions/setup-python@v5
       with:
-        python-version: '3.11'
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
     
-    - name: Cache pip dependencies
-      uses: actions/cache@v3
-      with:
-        path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-pip-
-    
-    - name: Install dependencies
+    - name: Install system dependencies
       run: |
-        python -m pip install --upgrade pip
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          libxml2-dev \
+          libxslt1-dev \
+          python3-dev
+    
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip wheel setuptools
         pip install -r requirements.txt
     
-    - name: Create output directories
+    - name: Create required directories
       run: |
         mkdir -p output ftp_downloads logs
+        chmod 755 output ftp_downloads logs
     
-    - name: Set environment variables
+    - name: Setup Google Cloud credentials
       env:
         GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+      run: |
+        echo "$GCP_SA_KEY" | base64 -d > /tmp/service-account-key.json
+        echo "GOOGLE_APPLICATION_CREDENTIALS=/tmp/service-account-key.json" >> $GITHUB_ENV
+        
+        # Verify the service account key is valid JSON
+        python -c "import json; json.load(open('/tmp/service-account-key.json'))" || {
+          echo "❌ Invalid service account key format"
+          exit 1
+        }
+    
+    - name: Verify environment setup
+      env:
         BUCKET_NAME: ${{ secrets.BUCKET_NAME }}
         BUCKET_FOLDER: ${{ secrets.BUCKET_FOLDER }}
+      run: |
+        echo "🔧 Environment Configuration:"
+        echo "Python Version: $(python --version)"
+        echo "Bucket Name: ${BUCKET_NAME}"
+        echo "Bucket Folder: ${BUCKET_FOLDER}"
+        echo "FTP Server: ${FTP_SERVER}"
+        echo "Working Directory: $(pwd)"
+        echo "Available Disk Space: $(df -h /tmp | tail -1)"
+        
+        # Test Google Cloud authentication
+        python -c "
+        from google.cloud import storage
+        client = storage.Client()
+        print('✅ Google Cloud authentication successful')
+        print(f'📦 Testing bucket access: ${BUCKET_NAME}')
+        bucket = client.bucket('${BUCKET_NAME}')
+        print('✅ Bucket access verified')
+        " || {
+          echo "❌ Google Cloud authentication failed"
+          exit 1
+        }
+    
+    - name: Test FTP connection
+      env:
         FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
         FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
       run: |
-        echo "BUCKET_NAME=$BUCKET_NAME" >> $GITHUB_ENV
-        echo "BUCKET_FOLDER=$BUCKET_FOLDER" >> $GITHUB_ENV
-        echo "LOCAL_OUTPUT_DIRECTORY=./output" >> $GITHUB_ENV
-        echo "FTP_DOWNLOAD_DIR=./ftp_downloads" >> $GITHUB_ENV
-        echo "FTP_SERVER=ftp.nivoda.net" >> $GITHUB_ENV
-        echo "FTP_PORT=21" >> $GITHUB_ENV
-        echo "FTP_USERNAME=$FTP_USERNAME" >> $GITHUB_ENV
-        echo "FTP_PASSWORD=$FTP_PASSWORD" >> $GITHUB_ENV
+        python -c "
+        import ftplib
+        import os
+        
+        print('🌐 Testing FTP connection...')
+        try:
+            with ftplib.FTP() as ftp:
+                ftp.connect('${FTP_SERVER}', ${FTP_PORT}, timeout=30)
+                ftp.login('${FTP_USERNAME}', '${FTP_PASSWORD}')
+                files = ftp.nlst()
+                print(f'✅ FTP connection successful. Found {len(files)} files.')
+                
+                # Check for required files
+                required_files = [
+                    'Leela Diamond_natural.csv',
+                    'Leela Diamond_labgrown.csv', 
+                    'Leela Diamond_gemstones.csv'
+                ]
+                
+                for req_file in required_files:
+                    if req_file in files:
+                        print(f'✅ Found required file: {req_file}')
+                    else:
+                        print(f'⚠️  Required file not found: {req_file}')
+                        
+        except Exception as e:
+            print(f'❌ FTP connection failed: {e}')
+            exit(1)
+        "
     
-    - name: Run feed generation script
+    - name: Run feed generation
       env:
-        GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-        GITHUB_ACTIONS: true
+        BUCKET_NAME: ${{ secrets.BUCKET_NAME }}
+        BUCKET_FOLDER: ${{ secrets.BUCKET_FOLDER }}
+        LOCAL_OUTPUT_DIRECTORY: './output'
+        FTP_DOWNLOAD_DIR: './ftp_downloads'
+        FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+        FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+        GITHUB_ACTIONS: 'true'
       run: |
-        python src/main.py
+        echo "🚀 Starting feed generation process..."
+        echo "📅 Start time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+        
+        # Run the main script with timeout and error handling
+        timeout 3600 python src/main.py 2>&1 | tee logs/feed_generation.log || {
+          echo "❌ Feed generation failed or timed out"
+          cat logs/feed_generation.log 2>/dev/null || echo "No log file found"
+          exit 1
+        }
+        
+        echo "✅ Feed generation completed"
+        echo "📅 End time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
     
-    - name: Upload logs as artifact
+    - name: Validate generated files
+      run: |
+        echo "🔍 Validating generated files..."
+        
+        # Check if main feed file exists and has content
+        if [[ -f "output/combined_google_merchant_feed.csv" ]]; then
+          file_size=$(stat -f%z "output/combined_google_merchant_feed.csv" 2>/dev/null || stat -c%s "output/combined_google_merchant_feed.csv")
+          line_count=$(wc -l < "output/combined_google_merchant_feed.csv")
+          echo "✅ Main feed file: ${file_size} bytes, ${line_count} lines"
+          
+          # Validate CSV format
+          python -c "
+          import pandas as pd
+          try:
+              df = pd.read_csv('output/combined_google_merchant_feed.csv')
+              print(f'✅ CSV validation passed: {len(df)} products')
+              
+              # Check required columns
+              required_cols = ['id', 'title', 'description', 'link', 'image_link', 'availability', 'price']
+              missing_cols = [col for col in required_cols if col not in df.columns]
+              if missing_cols:
+                  print(f'⚠️  Missing columns: {missing_cols}')
+              else:
+                  print('✅ All required columns present')
+                  
+          except Exception as e:
+              print(f'❌ CSV validation failed: {e}')
+              exit(1)
+          "
+        else
+          echo "❌ Main feed file not found!"
+          exit 1
+        fi
+        
+        # Check other generated files
+        for file in sitemap.xml robots.txt feed_metadata.json; do
+          if [[ -f "output/$file" ]]; then
+            file_size=$(stat -f%z "output/$file" 2>/dev/null || stat -c%s "output/$file")
+            echo "✅ $file: ${file_size} bytes"
+          else
+            echo "⚠️  Optional file not found: $file"
+          fi
+        done
+    
+    - name: Generate execution summary
       if: always()
-      uses: actions/upload-artifact@v3
+      run: |
+        echo "📊 **Execution Summary**" > execution_summary.md
+        echo "" >> execution_summary.md
+        echo "**Timestamp:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> execution_summary.md
+        echo "**Repository:** ${{ github.repository }}" >> execution_summary.md
+        echo "**Branch:** ${{ github.ref_name }}" >> execution_summary.md
+        echo "**Run ID:** ${{ github.run_id }}" >> execution_summary.md
+        echo "**Triggered by:** ${{ github.event_name }}" >> execution_summary.md
+        echo "" >> execution_summary.md
+        
+        if [[ -f "output/feed_metadata.json" ]]; then
+          echo "**Feed Statistics:**" >> execution_summary.md
+          python -c "
+          import json
+          try:
+              with open('output/feed_metadata.json', 'r') as f:
+                  metadata = json.load(f)
+              print(f'- Total Products: {metadata.get(\"total_products\", \"N/A\")}')
+              print(f'- Categories: {metadata.get(\"categories\", [])}')
+              print(f'- Currency: {metadata.get(\"currency\", \"N/A\")}')
+              print(f'- Last Updated: {metadata.get(\"last_updated\", \"N/A\")}')
+          except Exception as e:
+              print(f'- Error reading metadata: {e}')
+          " >> execution_summary.md
+        fi
+        
+        echo "" >> execution_summary.md
+        echo "**Generated Files:**" >> execution_summary.md
+        for file in output/*; do
+          if [[ -f "$file" ]]; then
+            filename=$(basename "$file")
+            size=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file")
+            echo "- $filename: ${size} bytes" >> execution_summary.md
+          fi
+        done
+        
+        cat execution_summary.md
+    
+    - name: Upload generated files as artifacts
+      uses: actions/upload-artifact@v4
+      if: always()
       with:
-        name: feed-generation-logs-${{ github.run_number }}
-        path: logs/
+        name: merchant-feed-${{ github.run_number }}-${{ github.run_attempt }}
+        path: |
+          output/
+          logs/
+          execution_summary.md
         retention-days: 30
+        if-no-files-found: warn
+        compression-level: 6
     
-    - name: Upload output files as artifact
+    - name: Create GitHub release on success
+      if: success() && github.event_name == 'schedule'
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: feed-${{ github.run_number }}
+        name: Daily Feed Generation - ${{ github.run_number }}
+        body_path: execution_summary.md
+        files: |
+          output/combined_google_merchant_feed.csv
+          output/sitemap.xml
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Clean up temporary files
       if: always()
-      uses: actions/upload-artifact@v3
-      with:
-        name: generated-feeds-${{ github.run_number }}
-        path: output/
-        retention-days: 7
+      run: |
+        rm -f /tmp/service-account-key.json
+        echo "🧹 Temporary files cleaned up"
     
-    - name: Notify on failure
-      if: failure()
-      uses: actions/github-script@v6
-      with:
-        script: |
-          const { owner, repo } = context.repo;
-          const run_id = context.runId;
-          const run_url = `https://github.com/${owner}/${repo}/actions/runs/${run_id}`;
-          
-          console.log(`❌ Feed generation failed!`);
-          console.log(`🔗 Check logs: ${run_url}`);
-          
-          // You can add email notification or Slack webhook here
-    
-    - name: Notify on success
+    - name: Send success notification
       if: success()
-      uses: actions/github-script@v6
-      with:
-        script: |
-          const fs = require('fs');
-          
-          try {
-            const metadata = JSON.parse(fs.readFileSync('./output/feed_metadata.json', 'utf8'));
-            console.log(`✅ Feed generation successful!`);
-            console.log(`📊 Total products processed: ${metadata.total_products || 'N/A'}`);
-            console.log(`🕐 Last updated: ${metadata.last_updated}`);
-          } catch (error) {
-            console.log(`✅ Feed generation completed successfully!`);
-          }
+      run: |
+        echo "::notice title=Feed Generation Success::Daily Google Merchant Center feed has been successfully generated and uploaded to Google Cloud Storage."
+        
+        if [[ -f "output/feed_metadata.json" ]]; then
+          python -c "
+          import json
+          try:
+              with open('output/feed_metadata.json', 'r') as f:
+                  metadata = json.load(f)
+              print(f'::notice title=Feed Statistics::Processed {metadata.get(\"total_products\", \"N/A\")} products across {len(metadata.get(\"categories\", []))} categories')
+          except:
+              pass
+          "
+        fi
+    
+    - name: Send failure notification
+      if: failure()
+      run: |
+        echo "::error title=Feed Generation Failed::Daily Google Merchant Center feed generation has failed. Check the logs for details."
+        echo "::error::Please review the workflow execution and fix any issues before the next scheduled run."
+        
+        # Output recent log entries for debugging
+        if [[ -f "logs/feed_generation.log" ]]; then
+          echo "::group::Recent Log Entries"
+          tail -20 logs/feed_generation.log || echo "Could not read log file"
+          echo "::endgroup::"
+        fi
